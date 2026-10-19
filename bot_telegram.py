@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Plataforma Cultural & Dantas Wats — Bot Telegram + Groq (Versão Produção Render)
+Plataforma Cultural & Dantas Wats — Bot Telegram + Groq (Versão Web Service Render Free)
 """
 import os
 import time
 import json
 import secrets
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from copy import deepcopy
 from pathlib import Path
 from datetime import datetime, timezone
@@ -17,6 +19,26 @@ from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
+
+# ==========================================
+# 0. MINI SERVIDOR HTTP PARA O RENDER (WEB SERVICE)
+# ==========================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Bot @Dcaptitabot online e operando em modo Web Service!")
+
+    def log_message(self, format, *args):
+        # Silencia logs HTTP repetitivos para manter o console limpo
+        return
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    log.info("🌐 Servidor HTTP web iniciado na porta %s", port)
+    server.serve_forever()
 
 # ==========================================
 # 1. CONFIGURAÇÃO E SEGREDOS
@@ -313,7 +335,7 @@ def handle_update(update):
         send_message(chat_id, ask_ai(text_in[:APP_CONFIG["max_message_chars"]]))
 
 # ==========================================
-# 7. LOOP DE ESCUTA (long polling)
+# 7. LOOP DE ESCUTA E INICIALIZAÇÃO WEB
 # ==========================================
 def run_bot():
     me = tg("getMe")
@@ -330,7 +352,7 @@ def run_bot():
         {"command": "ajuda", "description": "Ver comandos"},
     ])
 
-    log.info("🚀 Bot iniciado: @%s — pressione Stop para encerrar.", username)
+    log.info("🚀 Bot iniciado: @%s — ouvindo Telegram.", username)
     offset = None
     while True:
         try:
@@ -339,4 +361,33 @@ def run_bot():
                 params["offset"] = offset
             data = tg("getUpdates", timeout=30, **params)
 
-            if not data.get
+            if not data.get("ok"):
+                code = data.get("error_code")
+                log.error("getUpdates falhou (%s): %s", code, data.get("description"))
+                if code in (401, 404):
+                    raise SystemExit("Token inválido/revogado. Gere um novo no @BotFather.")
+                time.sleep(5)
+                continue
+
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                try:
+                    handle_update(upd)
+                except Exception:
+                    log.exception("Erro ao processar update %s", upd.get("update_id"))
+        except KeyboardInterrupt:
+            log.info("⏹️ Bot interrompido.")
+            break
+        except SystemExit:
+            raise
+        except Exception:
+            log.exception("Erro inesperado no loop")
+            time.sleep(3)
+
+if __name__ == "__main__":
+    # Inicia o mini servidor web em segundo plano (thread paralela) para atender o Web Service do Render
+    web_thread = threading.Thread(target=run_http_server, daemon=True)
+    web_thread.start()
+    
+    # Inicia o motor principal do bot do Telegram
+    run_bot()
