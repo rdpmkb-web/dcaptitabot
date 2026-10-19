@@ -11,36 +11,57 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from openai import OpenAI
 
+def _env_int(name: str, default: int, *, minimum: int, maximum: int | None = None) -> int:
+    """Lê inteiro do ambiente com validação e fallback seguro."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logging.getLogger("bot").warning("%s inválida; usando valor padrão %s", name, default)
+        return default
+    if value < minimum or (maximum is not None and value > maximum):
+        logging.getLogger("bot").warning("%s fora do intervalo permitido; usando %s", name, default)
+        return default
+    return value
+
+
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+if _LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    _LOG_LEVEL = "INFO"
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+    level=_LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("bot")
-
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ---- Configuração: segredos exclusivamente por variáveis de ambiente ----
+# ---- Configuração centralizada; segredos vêm exclusivamente do ambiente ----
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "5672036643").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
-PORT = int(os.getenv("PORT", "10000"))
-MAX_WORKERS = max(2, min(16, int(os.getenv("BOT_WORKERS", "4"))))
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
+PORT = _env_int("PORT", 10000, minimum=1, maximum=65535)
+MAX_WORKERS = _env_int("BOT_WORKERS", 4, minimum=1, maximum=32)
 
-BASE_DIR = Path(os.getenv("PLATAFORMA_DIR", "/data/plataforma_cultural" if os.getenv("RENDER") else "./plataforma_cultural"))
+_default_data_dir = "/data/plataforma_cultural" if os.getenv("RENDER") else "./plataforma_cultural"
+BASE_DIR = Path(os.getenv("PLATAFORMA_DIR", _default_data_dir)).expanduser()
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = BASE_DIR / "data.json"
 AUDIT_FILE = BASE_DIR / "audit.jsonl"
-
 APP_CONFIG = {
     "brand_name": "Plataforma Cultural & Dantas Wats",
     "tagline": "Inteligência operacional para cultura e automação elétrica em Salvador.",
@@ -77,11 +98,15 @@ QUESTIONS = [
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "PlataformaCulturalBot/1.0"})
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
-client_groq = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=GROQ_API_KEY or "missing-api-key",
-    timeout=45.0,
-    max_retries=2,
+client_groq = (
+    OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=GROQ_API_KEY,
+        timeout=45.0,
+        max_retries=2,
+    )
+    if GROQ_API_KEY
+    else None
 )
 
 DB_LOCK = threading.RLock()
@@ -167,32 +192,40 @@ def user_lock(uid) -> threading.Lock:
         return USER_LOCKS[key]
 
 
-# ---- HTTP health check para Render ----
+# ---- Servidor HTTP mínimo para health checks da hospedagem ----
 class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Responde somente às rotas de saúde usadas pela plataforma."""
+
+    server_version = "PlataformaHealth/1.0"
+
     def do_GET(self):
-        if self.path not in ("/", "/health", "/healthz"):
-            self.send_error(404)
+        route = urlsplit(self.path).path
+        if route not in ("/", "/health", "/healthz"):
+            self.send_error(HTTPStatus.NOT_FOUND)
             return
-        body = b"Plataforma Cultural & Dantas Wats: online"
-        self.send_response(200)
+        body = b"Plataforma Cultural & Dantas Wats: online\n"
+        self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        return
+        # Evita logs HTTP repetitivos; eventos da aplicação são registrados pelo logger.
+        log.debug("HTTP health check: " + fmt, *args)
 
 
-def run_http_server():
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    server.daemon_threads = True
-    log.info("Servidor HTTP de saúde ativo na porta %s", PORT)
-    try:
-        server.serve_forever(poll_interval=0.5)
-    finally:
-        server.server_close()
-
+def run_http_server() -> None:
+    """Executa o servidor de saúde; o contexto garante fechamento do socket."""
+    with ThreadingHTTPServer(("0.0.0.0", PORT), HealthCheckHandler) as server:
+        server.daemon_threads = True
+        log.info("Health check HTTP escutando na porta %s", PORT)
+        try:
+            server.serve_forever(poll_interval=0.5)
+        except OSError:
+            log.exception("Servidor HTTP de saúde encerrou com erro")
+            raise
 
 # ---- Telegram helpers ----
 def tg(method: str, timeout=30, **payload) -> dict:
@@ -208,6 +241,7 @@ def tg(method: str, timeout=30, **payload) -> dict:
             return {"ok": False, "error_code": response.status_code, "description": "Erro HTTP do Telegram"}
         return result
     except requests.RequestException as exc:
+        log.warning("Falha de comunicação com a API do Telegram (%s): %s", method, exc)
         return {"ok": False, "error_code": 0, "description": str(exc)[:200]}
 
 
@@ -239,7 +273,7 @@ def send_message(chat_id, text) -> None:
 
 
 def ask_ai(user_prompt: str) -> str:
-    if not GROQ_API_KEY:
+    if not GROQ_API_KEY or client_groq is None:
         return "A IA ainda não está configurada. O administrador deve definir GROQ_API_KEY nas variáveis de ambiente."
     try:
         completion = client_groq.chat.completions.create(
@@ -459,12 +493,19 @@ def run_bot() -> None:
                 time.sleep(3)
 
 
-def main():
+def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("Defina TELEGRAM_BOT_TOKEN nas variáveis de ambiente.")
+        raise SystemExit("Configuração ausente: defina TELEGRAM_BOT_TOKEN nas variáveis de ambiente do serviço.")
+    if not GROQ_API_KEY:
+        log.warning("GROQ_API_KEY ausente: comandos sem IA funcionarão, mas análises e respostas de IA não.")
+    log.info("Iniciando serviço; modelo Groq=%s; diretório de dados=%s", GROQ_MODEL, BASE_DIR)
     http_thread = threading.Thread(target=run_http_server, name="health-http", daemon=True)
     http_thread.start()
-    run_bot()
+    try:
+        run_bot()
+    finally:
+        STOP.set()
+        log.info("Encerramento do bot concluído")
 
 
 if __name__ == "__main__":
