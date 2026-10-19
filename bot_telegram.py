@@ -440,3 +440,13 @@ def run_bot():
         except Exception:
             log.exception("Erro inesperado no loop")
             time.sleep(3)
+
+# Inicialização automática compatível com Gunicorn e Execução Direta
+if __name__ == "__main__":
+    telegram_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    telegram_thread.start()
+    run_http_server()
+else:
+    # Quando o Gunicorn importa o módulo, inicia o Telegram em background e expõe run_http_server
+    telegram_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    telegram_thread.start()
