@@ -390,4 +390,53 @@ if __name__ == "__main__":
     web_thread.start()
     
     # Inicia o motor principal do bot do Telegram
-    run_bot()
+    # ==========================================
+# 7. LOOP DE ESCUTA E INICIALIZAÇÃO WEB
+# ==========================================
+def run_bot():
+    me = tg("getMe")
+    if not me.get("ok"):
+        raise SystemExit(f"Token inválido ou sem acesso ao Telegram: {me.get('description')}")
+    username = me["result"].get("username")
+
+    tg("deleteWebhook", drop_pending_updates=False)
+    tg("setMyCommands", commands=[
+        {"command": "novo_projeto", "description": "Iniciar novo projeto"},
+        {"command": "diagnostico", "description": "Análise técnica e comercial"},
+        {"command": "planos", "description": "Planos e limites"},
+        {"command": "cancelar", "description": "Cancelar preenchimento"},
+        {"command": "ajuda", "description": "Ver comandos"},
+    ])
+
+    log.info("🚀 Bot iniciado: @%s — ouvindo Telegram.", username)
+    offset = None
+    while True:
+        try:
+            params = {"allowed_updates": ["message"]}
+            if offset is not None:
+                params["offset"] = offset
+            # CORREÇÃO: Removido o timeout duplicado; agora passamos apenas via **params ou argumento único
+            data = tg("getUpdates", timeout=30, **params)
+
+            if not data.get("ok"):
+                code = data.get("error_code")
+                log.error("getUpdates falhou (%s): %s", code, data.get("description"))
+                if code in (401, 404):
+                    raise SystemExit("Token inválido/revogado. Gere um novo no @BotFather.")
+                time.sleep(5)
+                continue
+
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                try:
+                    handle_update(upd)
+                except Exception:
+                    log.exception("Erro ao processar update %s", upd.get("update_id"))
+        except KeyboardInterrupt:
+            log.info("⏹️ Bot interrompido.")
+            break
+        except SystemExit:
+            raise
+        except Exception:
+            log.exception("Erro inesperado no loop")
+            time.sleep(3)
