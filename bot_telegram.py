@@ -116,8 +116,76 @@ AI_CALLS_LOCK = threading.Lock()
 LAST_AI_CALL: dict[str, float] = {}
 STOP = threading.Event()
 
+# Operational heartbeat for the Telegram long-polling loop. Liveness remains
+# separate from readiness so an independent monitor can detect a disconnected bot.
+POLL_STALE_AFTER_SECONDS = 90
+POLL_HEALTH_LOCK = threading.Lock()
+POLL_HEALTH = {
+    "state": "starting",
+    "bot_authenticated": False,
+    "last_successful_poll_at": None,
+    "last_successful_poll_epoch": None,
+    "last_error_code": None,
+}
 
-def load_json(path: Path, default):
+
+def record_poll_health(
+    state: str,
+    *,
+    authenticated: bool | None = None,
+    error_code: int | None = None,
+    successful_poll: bool = False,
+) -> None:
+    """Update operational metadata only; never include credentials or user content."""
+    with POLL_HEALTH_LOCK:
+        POLL_HEALTH["state"] = state
+        if authenticated is not None:
+            POLL_HEALTH["bot_authenticated"] = authenticated
+        POLL_HEALTH["last_error_code"] = error_code
+        if successful_poll:
+            now = time.time()
+            POLL_HEALTH["last_successful_poll_epoch"] = now
+            POLL_HEALTH["last_successful_poll_at"] = datetime.fromtimestamp(
+                now, timezone.utc
+            ).isoformat()
+
+
+def polling_health_snapshot(now_epoch: float | None = None) -> tuple[int, dict]:
+    """Return readiness based on recent successful Telegram getUpdates calls."""
+    with POLL_HEALTH_LOCK:
+        snapshot = dict(POLL_HEALTH)
+
+    now = time.time() if now_epoch is None else now_epoch
+    last_poll = snapshot.get("last_successful_poll_epoch")
+    age_seconds = max(0, int(now - last_poll)) if isinstance(last_poll, (int, float)) else None
+
+    reason = None
+    if not TELEGRAM_BOT_TOKEN:
+        reason = "bot_token_not_configured"
+    elif not snapshot["bot_authenticated"]:
+        reason = "telegram_not_authenticated"
+    elif snapshot["state"] != "polling":
+        reason = snapshot["state"]
+    elif age_seconds is None:
+        reason = "no_successful_poll_yet"
+    elif age_seconds > POLL_STALE_AFTER_SECONDS:
+        reason = "polling_heartbeat_stale"
+
+    ready = reason is None
+    return (200 if ready else 503), {
+        "status": "ready" if ready else "not_ready",
+        "telegram_polling": {
+            "state": snapshot["state"],
+            "bot_authenticated": snapshot["bot_authenticated"],
+            "last_successful_poll_at": snapshot["last_successful_poll_at"],
+            "last_successful_poll_age_seconds": age_seconds,
+            "last_error_code": snapshot["last_error_code"],
+            "reason": reason,
+        },
+    }
+
+
+def load_json(path: Path, default):def load_json(path: Path, default):
     try:
         if path.exists():
             with path.open("r", encoding="utf-8") as f:
@@ -200,6 +268,17 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         route = urlsplit(self.path).path
+        if route == "/readyz":
+            status_code, payload = polling_health_snapshot()
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if route not in ("/", "/health", "/healthz"):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -437,14 +516,18 @@ def process_update_safe(update: dict) -> None:
 
 
 def run_bot() -> None:
+    record_poll_health("starting", authenticated=False)
     if not TELEGRAM_BOT_TOKEN:
+        record_poll_health("configuration_error", authenticated=False)
         raise SystemExit("Configuração ausente: defina TELEGRAM_BOT_TOKEN nas variáveis de ambiente.")
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY não configurada: comandos básicos funcionam, mas a IA ficará indisponível.")
 
     me = tg("getMe", timeout=20)
     if not me.get("ok"):
+        record_poll_health("telegram_auth_failed", authenticated=False, error_code=me.get("error_code"))
         raise SystemExit(f"Telegram não autenticou o bot: {me.get('description', 'erro desconhecido')}")
+    record_poll_health("connecting", authenticated=True)
     username = me.get("result", {}).get("username", "desconhecido")
 
     webhook = tg("deleteWebhook", timeout=20, drop_pending_updates=False)
@@ -473,13 +556,22 @@ def run_bot() -> None:
                     code = data.get("error_code")
                     log.error("getUpdates falhou (%s): %s", code, data.get("description"))
                     if code == 409:
+                        record_poll_health("polling_conflict", authenticated=True, error_code=code)
                         log.error("Conflito de polling: outro processo ou webhook está usando este bot.")
                         time.sleep(10)
                     elif code in (401, 404):
+                        record_poll_health("telegram_auth_failed", authenticated=False, error_code=code)
                         raise SystemExit("Token inválido/revogado. Gere um novo no @BotFather.")
                     else:
+                        record_poll_health("polling_degraded", authenticated=True, error_code=code)
                         time.sleep(5)
                     continue
+                record_poll_health(
+                    "polling",
+                    authenticated=True,
+                    error_code=None,
+                    successful_poll=True,
+                )
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
                     pool.submit(process_update_safe, update)
@@ -489,6 +581,7 @@ def run_bot() -> None:
             except SystemExit:
                 raise
             except Exception:
+                record_poll_health("polling_degraded", authenticated=True)
                 log.exception("Erro inesperado no loop de polling")
                 time.sleep(3)
 
