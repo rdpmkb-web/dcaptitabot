@@ -24,8 +24,15 @@ class PollingAcknowledgementTests(unittest.TestCase):
 
 class PollingReadinessTests(unittest.TestCase):
     def test_missing_token_is_not_ready(self):
+        health = {
+            "state": "stopped",
+            "bot_authenticated": False,
+            "last_successful_poll_at": None,
+            "last_successful_poll_epoch": None,
+            "last_error_code": None,
+        }
         with patch.object(bot_telegram, "TELEGRAM_BOT_TOKEN", ""), patch.dict(
-            bot_telegram.POLL_HEALTH, {}, clear=True
+            bot_telegram.POLL_HEALTH, health, clear=True
         ):
             status, payload = bot_telegram.polling_health_snapshot(now_epoch=1000)
         self.assertEqual(status, 503)
