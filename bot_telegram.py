@@ -348,7 +348,8 @@ def send_message(chat_id, text) -> None:
     if outbox is not None:
         message_text = str(text).strip()
         if message_text and not message_text.startswith(("⚡ Processando", "⚡ Analisando")):
-            outbox.append({"chat_id": chat_id, "text": message_text})
+            for chunk in split_text(message_text):
+                outbox.append({"chat_id": chat_id, "text": chunk, "delivered": False})
         return
     for chunk in split_text(text):
         result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
@@ -518,6 +519,35 @@ def handle_update(update: dict) -> None:
             send_message(chat_id, ask_ai(incoming[:APP_CONFIG["max_message_chars"]]))
 
 
+def deliver_update_outbox(update_key: str) -> None:
+    """Deliver each persisted chunk and record its confirmation independently."""
+    while True:
+        with DB_LOCK:
+            receipt = DB["processed_updates"][update_key]
+            pending_index = next(
+                (i for i, item in enumerate(receipt.get("outbox", [])) if not item.get("delivered", False)),
+                None,
+            )
+            if pending_index is None:
+                receipt["delivered"] = True
+                save_json(DATA_FILE, DB)
+                return
+            item = receipt["outbox"][pending_index]
+
+        result = tg("sendMessage", timeout=20, chat_id=item["chat_id"], text=item["text"])
+        if not result.get("ok") and result.get("error_code") == 429:
+            retry = result.get("parameters", {}).get("retry_after", 2)
+            time.sleep(min(max(int(retry), 1), 10))
+            result = tg("sendMessage", timeout=20, chat_id=item["chat_id"], text=item["text"])
+        if not result.get("ok"):
+            log.error("sendMessage falhou; update não será confirmado: %s", result.get("description"))
+            raise RuntimeError("Telegram sendMessage failed")
+
+        with DB_LOCK:
+            DB["processed_updates"][update_key]["outbox"][pending_index]["delivered"] = True
+            save_json(DATA_FILE, DB)
+
+
 def process_update_safe(update: dict) -> bool:
     """Persist update effects and its outbound outbox before acknowledging Telegram."""
     update_id = update.get("update_id")
@@ -531,11 +561,7 @@ def process_update_safe(update: dict) -> bool:
         if receipt.get("delivered", False):
             return True
         try:
-            for item in receipt.get("outbox", []):
-                send_message(item["chat_id"], item["text"])
-            with DB_LOCK:
-                DB["processed_updates"][key]["delivered"] = True
-                save_json(DATA_FILE, DB)
+            deliver_update_outbox(key)
             return True
         except Exception:
             log.exception("Falha ao reenviar outbox do update_id=%s", update_id)
@@ -567,11 +593,7 @@ def process_update_safe(update: dict) -> bool:
         return False
 
     try:
-        for item in outbox:
-            send_message(item["chat_id"], item["text"])
-        with DB_LOCK:
-            DB["processed_updates"][key]["delivered"] = True
-            save_json(DATA_FILE, DB)
+        deliver_update_outbox(key)
         return True
     except Exception:
         log.exception("Entrega pendente para update_id=%s; resposta ficou em outbox durável", update_id)
