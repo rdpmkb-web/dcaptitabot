@@ -567,8 +567,13 @@ def process_update_safe(update: dict) -> bool:
             log.exception("Falha ao reenviar outbox do update_id=%s", update_id)
             return False
 
+    message = update.get("message") or {}
+    sender = message.get("from") or {}
+    uid_key = str(sender["id"]) if sender.get("id") is not None else None
     with DB_LOCK:
-        snapshot = deepcopy(DB)
+        had_user = uid_key in DB["users"] if uid_key is not None else False
+        user_snapshot = deepcopy(DB["users"].get(uid_key)) if had_user else None
+        referrals_snapshot = deepcopy(DB["referrals"]) if not had_user else None
     UPDATE_CONTEXT.defer_save = True
     UPDATE_CONTEXT.outbox = []
     try:
@@ -587,8 +592,15 @@ def process_update_safe(update: dict) -> bool:
         UPDATE_CONTEXT.defer_save = False
         UPDATE_CONTEXT.outbox = None
         with DB_LOCK:
-            DB.clear()
-            DB.update(snapshot)
+            # Roll back only this sender's state; never overwrite other users' concurrent work.
+            if uid_key is not None:
+                if had_user:
+                    DB["users"][uid_key] = user_snapshot
+                else:
+                    DB["users"].pop(uid_key, None)
+                    if referrals_snapshot is not None:
+                        DB["referrals"].clear()
+                        DB["referrals"].update(referrals_snapshot)
         log.exception("Falha ao processar update_id=%s; update continuará pendente", update_id)
         return False
 
