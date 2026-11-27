@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import bot_telegram
@@ -99,6 +101,62 @@ class FailedDeliveryTests(unittest.TestCase):
         update = {"update_id": 88, "message": {"text": "teste"}}
         with patch.object(bot_telegram, "handle_update", side_effect=RuntimeError("send failed")):
             self.assertFalse(bot_telegram.process_update_safe(update))
+
+
+class DurableIdempotencyTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.data_file = Path(self.tempdir.name) / "data.json"
+        self.db = {"users": {}, "referrals": {}, "processed_updates": {}}
+        self.db_patch = patch.object(bot_telegram, "DB", self.db)
+        self.data_patch = patch.object(bot_telegram, "DATA_FILE", self.data_file)
+        self.db_patch.start()
+        self.data_patch.start()
+        self.addCleanup(self.db_patch.stop)
+        self.addCleanup(self.data_patch.stop)
+
+    def test_duplicate_delivered_update_does_not_reprocess_or_resend(self):
+        update = {"update_id": 501}
+        calls = []
+        def handler(_update):
+            calls.append("processed")
+            bot_telegram.DB["users"]["counter"] = bot_telegram.DB["users"].get("counter", 0) + 1
+            bot_telegram.send_message(123, "resposta única")
+
+        with patch.object(bot_telegram, "handle_update", side_effect=handler), patch.object(
+            bot_telegram, "tg", return_value={"ok": True}
+        ) as telegram:
+            self.assertTrue(bot_telegram.process_update_safe(update))
+            telegram.reset_mock()
+            self.assertTrue(bot_telegram.process_update_safe(update))
+            telegram.assert_not_called()
+
+        self.assertEqual(calls, ["processed"])
+        self.assertEqual(self.db["users"]["counter"], 1)
+        self.assertTrue(self.db["processed_updates"]["501"]["delivered"])
+
+    def test_failed_delivery_retries_outbox_without_reprocessing(self):
+        update = {"update_id": 502}
+        calls = []
+        def handler(_update):
+            calls.append("processed")
+            bot_telegram.DB["users"]["counter"] = 1
+            bot_telegram.send_message(123, "resposta pendente")
+
+        outcomes = iter([
+            {"ok": False, "error_code": 500, "description": "temporary failure"},
+            {"ok": True},
+        ])
+        with patch.object(bot_telegram, "handle_update", side_effect=handler), patch.object(
+            bot_telegram, "tg", side_effect=lambda *args, **kwargs: next(outcomes)
+        ):
+            self.assertFalse(bot_telegram.process_update_safe(update))
+            self.assertTrue(bot_telegram.process_update_safe(update))
+
+        self.assertEqual(calls, ["processed"])
+        self.assertEqual(self.db["users"]["counter"], 1)
+        self.assertTrue(self.db["processed_updates"]["502"]["delivered"])
 
 
 if __name__ == "__main__":
