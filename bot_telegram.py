@@ -528,9 +528,14 @@ def process_update_safe(update: dict) -> bool:
     with DB_LOCK:
         receipt = DB.setdefault("processed_updates", {}).get(key)
     if receipt is not None:
+        if receipt.get("delivered", False):
+            return True
         try:
             for item in receipt.get("outbox", []):
                 send_message(item["chat_id"], item["text"])
+            with DB_LOCK:
+                DB["processed_updates"][key]["delivered"] = True
+                save_json(DATA_FILE, DB)
             return True
         except Exception:
             log.exception("Falha ao reenviar outbox do update_id=%s", update_id)
@@ -548,6 +553,7 @@ def process_update_safe(update: dict) -> bool:
         with DB_LOCK:
             DB.setdefault("processed_updates", {})[key] = {
                 "completed_at": utc_now(),
+                "delivered": False,
                 "outbox": outbox,
             }
             save_json(DATA_FILE, DB)
@@ -563,6 +569,9 @@ def process_update_safe(update: dict) -> bool:
     try:
         for item in outbox:
             send_message(item["chat_id"], item["text"])
+        with DB_LOCK:
+            DB["processed_updates"][key]["delivered"] = True
+            save_json(DATA_FILE, DB)
         return True
     except Exception:
         log.exception("Entrega pendente para update_id=%s; resposta ficou em outbox durável", update_id)
