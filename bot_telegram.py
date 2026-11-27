@@ -200,6 +200,8 @@ if not isinstance(DB, dict):
     DB = {"users": {}, "referrals": {}}
 DB.setdefault("users", {})
 DB.setdefault("referrals", {})
+DB.setdefault("processed_updates", {})
+UPDATE_CONTEXT = threading.local()
 
 
 def save_json(path: Path, data) -> None:
@@ -212,6 +214,8 @@ def save_json(path: Path, data) -> None:
 
 
 def save_db() -> None:
+    if getattr(UPDATE_CONTEXT, "defer_save", False):
+        return
     with DB_LOCK:
         save_json(DATA_FILE, DB)
 
@@ -240,7 +244,7 @@ def get_user(uid) -> dict:
                 "projects": [], "referral_code": ref, "consent_notice_seen": False,
             }
             DB["referrals"][ref] = {"owner_id": key, "signups": 0}
-            save_json(DATA_FILE, DB)
+            save_db()
             audit("user_created", key)
         user = DB["users"][key]
         # Compatibilidade com registros antigos.
@@ -338,6 +342,14 @@ def split_text(text: str, size=4000) -> list[str]:
 
 
 def send_message(chat_id, text) -> None:
+    # During update processing, capture outbound messages so state and outbox can be
+    # persisted together before any network delivery is attempted.
+    outbox = getattr(UPDATE_CONTEXT, "outbox", None)
+    if outbox is not None:
+        message_text = str(text).strip()
+        if message_text and not message_text.startswith(("⚡ Processando", "⚡ Analisando")):
+            outbox.append({"chat_id": chat_id, "text": message_text})
+        return
     for chunk in split_text(text):
         result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
         if not result.get("ok") and result.get("error_code") == 429:
@@ -507,12 +519,53 @@ def handle_update(update: dict) -> None:
 
 
 def process_update_safe(update: dict) -> bool:
-    """Return True only when processing completed; False keeps the Telegram update pending."""
+    """Persist update effects and its outbound outbox before acknowledging Telegram."""
+    update_id = update.get("update_id")
+    if update_id is None:
+        log.error("Update sem update_id; não será confirmado")
+        return False
+    key = str(update_id)
+    with DB_LOCK:
+        receipt = DB.setdefault("processed_updates", {}).get(key)
+    if receipt is not None:
+        try:
+            for item in receipt.get("outbox", []):
+                send_message(item["chat_id"], item["text"])
+            return True
+        except Exception:
+            log.exception("Falha ao reenviar outbox do update_id=%s", update_id)
+            return False
+
+    with DB_LOCK:
+        snapshot = deepcopy(DB)
+    UPDATE_CONTEXT.defer_save = True
+    UPDATE_CONTEXT.outbox = []
     try:
         handle_update(update)
+        outbox = deepcopy(UPDATE_CONTEXT.outbox)
+        UPDATE_CONTEXT.defer_save = False
+        UPDATE_CONTEXT.outbox = None
+        with DB_LOCK:
+            DB.setdefault("processed_updates", {})[key] = {
+                "completed_at": utc_now(),
+                "outbox": outbox,
+            }
+            save_json(DATA_FILE, DB)
+    except Exception:
+        UPDATE_CONTEXT.defer_save = False
+        UPDATE_CONTEXT.outbox = None
+        with DB_LOCK:
+            DB.clear()
+            DB.update(snapshot)
+        log.exception("Falha ao processar update_id=%s; update continuará pendente", update_id)
+        return False
+
+    try:
+        for item in outbox:
+            send_message(item["chat_id"], item["text"])
         return True
     except Exception:
-        log.exception("Falha ao processar update_id=%s; update continuará pendente", update.get("update_id"))
+        log.exception("Entrega pendente para update_id=%s; resposta ficou em outbox durável", update_id)
         return False
 
 
