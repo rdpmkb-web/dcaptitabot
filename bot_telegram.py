@@ -315,7 +315,7 @@ def tg(method: str, request_timeout=30, **payload) -> dict:
     if not TELEGRAM_API:
         return {"ok": False, "error_code": 0, "description": "TELEGRAM_BOT_TOKEN não configurado"}
     try:
-        response = HTTP.post(f"{TELEGRAM_API}/{method}", json=payload, request_timeout=timeout)
+        response = HTTP.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=request_timeout)
         try:
             result = response.json()
         except ValueError:
