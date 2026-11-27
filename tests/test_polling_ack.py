@@ -187,5 +187,27 @@ class DurableIdempotencyTests(unittest.TestCase):
         self.assertTrue(all(item["delivered"] for item in self.db["processed_updates"]["503"]["outbox"]))
 
 
+
+class TelegramTimeoutSeparationTests(unittest.TestCase):
+    def test_http_timeout_and_telegram_long_poll_timeout_are_separate(self):
+        response = type("Response", (), {"status_code": 200, "json": lambda self: {"ok": True}})()
+        with patch.object(bot_telegram, "TELEGRAM_API", "https://api.telegram.org/botTEST"), patch.object(
+            bot_telegram.HTTP, "post", return_value=response
+        ) as post:
+            result = bot_telegram.tg(
+                "getUpdates",
+                request_timeout=35,
+                timeout=25,
+                allowed_updates=["message"],
+            )
+        self.assertTrue(result["ok"])
+        post.assert_called_once_with(
+            "https://api.telegram.org/botTEST/getUpdates",
+            json={"timeout": 25, "allowed_updates": ["message"]},
+            timeout=35,
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()
