@@ -116,6 +116,74 @@ AI_CALLS_LOCK = threading.Lock()
 LAST_AI_CALL: dict[str, float] = {}
 STOP = threading.Event()
 
+# Operational heartbeat for the Telegram long-polling loop. Liveness remains
+# separate from readiness so an independent monitor can detect a disconnected bot.
+POLL_STALE_AFTER_SECONDS = 90
+POLL_HEALTH_LOCK = threading.Lock()
+POLL_HEALTH = {
+    "state": "starting",
+    "bot_authenticated": False,
+    "last_successful_poll_at": None,
+    "last_successful_poll_epoch": None,
+    "last_error_code": None,
+}
+
+
+def record_poll_health(
+    state: str,
+    *,
+    authenticated: bool | None = None,
+    error_code: int | None = None,
+    successful_poll: bool = False,
+) -> None:
+    """Update operational metadata only; never include credentials or user content."""
+    with POLL_HEALTH_LOCK:
+        POLL_HEALTH["state"] = state
+        if authenticated is not None:
+            POLL_HEALTH["bot_authenticated"] = authenticated
+        POLL_HEALTH["last_error_code"] = error_code
+        if successful_poll:
+            now = time.time()
+            POLL_HEALTH["last_successful_poll_epoch"] = now
+            POLL_HEALTH["last_successful_poll_at"] = datetime.fromtimestamp(
+                now, timezone.utc
+            ).isoformat()
+
+
+def polling_health_snapshot(now_epoch: float | None = None) -> tuple[int, dict]:
+    """Return readiness based on recent successful Telegram getUpdates calls."""
+    with POLL_HEALTH_LOCK:
+        snapshot = dict(POLL_HEALTH)
+
+    now = time.time() if now_epoch is None else now_epoch
+    last_poll = snapshot.get("last_successful_poll_epoch")
+    age_seconds = max(0, int(now - last_poll)) if isinstance(last_poll, (int, float)) else None
+
+    reason = None
+    if not TELEGRAM_BOT_TOKEN:
+        reason = "bot_token_not_configured"
+    elif not snapshot["bot_authenticated"]:
+        reason = "telegram_not_authenticated"
+    elif snapshot["state"] != "polling":
+        reason = snapshot["state"]
+    elif age_seconds is None:
+        reason = "no_successful_poll_yet"
+    elif age_seconds > POLL_STALE_AFTER_SECONDS:
+        reason = "polling_heartbeat_stale"
+
+    ready = reason is None
+    return (200 if ready else 503), {
+        "status": "ready" if ready else "not_ready",
+        "telegram_polling": {
+            "state": snapshot["state"],
+            "bot_authenticated": snapshot["bot_authenticated"],
+            "last_successful_poll_at": snapshot["last_successful_poll_at"],
+            "last_successful_poll_age_seconds": age_seconds,
+            "last_error_code": snapshot["last_error_code"],
+            "reason": reason,
+        },
+    }
+
 
 def load_json(path: Path, default):
     try:
@@ -132,6 +200,8 @@ if not isinstance(DB, dict):
     DB = {"users": {}, "referrals": {}}
 DB.setdefault("users", {})
 DB.setdefault("referrals", {})
+DB.setdefault("processed_updates", {})
+UPDATE_CONTEXT = threading.local()
 
 
 def save_json(path: Path, data) -> None:
@@ -144,6 +214,8 @@ def save_json(path: Path, data) -> None:
 
 
 def save_db() -> None:
+    if getattr(UPDATE_CONTEXT, "defer_save", False):
+        return
     with DB_LOCK:
         save_json(DATA_FILE, DB)
 
@@ -172,7 +244,7 @@ def get_user(uid) -> dict:
                 "projects": [], "referral_code": ref, "consent_notice_seen": False,
             }
             DB["referrals"][ref] = {"owner_id": key, "signups": 0}
-            save_json(DATA_FILE, DB)
+            save_db()
             audit("user_created", key)
         user = DB["users"][key]
         # Compatibilidade com registros antigos.
@@ -200,6 +272,17 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         route = urlsplit(self.path).path
+        if route == "/readyz":
+            status_code, payload = polling_health_snapshot()
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if route not in ("/", "/health", "/healthz"):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -259,17 +342,24 @@ def split_text(text: str, size=4000) -> list[str]:
 
 
 def send_message(chat_id, text) -> None:
+    # During update processing, capture outbound messages so state and outbox can be
+    # persisted together before any network delivery is attempted.
+    outbox = getattr(UPDATE_CONTEXT, "outbox", None)
+    if outbox is not None:
+        message_text = str(text).strip()
+        if message_text and not message_text.startswith(("⚡ Processando", "⚡ Analisando")):
+            for chunk in split_text(message_text):
+                outbox.append({"chat_id": chat_id, "text": chunk, "delivered": False})
+        return
     for chunk in split_text(text):
         result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
+        if not result.get("ok") and result.get("error_code") == 429:
+            retry = result.get("parameters", {}).get("retry_after", 2)
+            time.sleep(min(max(int(retry), 1), 10))
+            result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
         if not result.get("ok"):
-            log.warning("sendMessage falhou: %s", result.get("description"))
-            # Limite de taxa/erro temporário: tentativa única curta.
-            if result.get("error_code") == 429:
-                retry = result.get("parameters", {}).get("retry_after", 2)
-                time.sleep(min(max(int(retry), 1), 10))
-                result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
-                if not result.get("ok"):
-                    log.warning("Repetição sendMessage falhou: %s", result.get("description"))
+            log.error("sendMessage falhou; update não será confirmado: %s", result.get("description"))
+            raise RuntimeError("Telegram sendMessage failed")
 
 
 def ask_ai(user_prompt: str) -> str:
@@ -429,22 +519,121 @@ def handle_update(update: dict) -> None:
             send_message(chat_id, ask_ai(incoming[:APP_CONFIG["max_message_chars"]]))
 
 
-def process_update_safe(update: dict) -> None:
+def deliver_update_outbox(update_key: str) -> None:
+    """Deliver each persisted chunk and record its confirmation independently."""
+    while True:
+        with DB_LOCK:
+            receipt = DB["processed_updates"][update_key]
+            pending_index = next(
+                (i for i, item in enumerate(receipt.get("outbox", [])) if not item.get("delivered", False)),
+                None,
+            )
+            if pending_index is None:
+                receipt["delivered"] = True
+                save_json(DATA_FILE, DB)
+                return
+            item = receipt["outbox"][pending_index]
+
+        result = tg("sendMessage", timeout=20, chat_id=item["chat_id"], text=item["text"])
+        if not result.get("ok") and result.get("error_code") == 429:
+            retry = result.get("parameters", {}).get("retry_after", 2)
+            time.sleep(min(max(int(retry), 1), 10))
+            result = tg("sendMessage", timeout=20, chat_id=item["chat_id"], text=item["text"])
+        if not result.get("ok"):
+            log.error("sendMessage falhou; update não será confirmado: %s", result.get("description"))
+            raise RuntimeError("Telegram sendMessage failed")
+
+        with DB_LOCK:
+            DB["processed_updates"][update_key]["outbox"][pending_index]["delivered"] = True
+            save_json(DATA_FILE, DB)
+
+
+def process_update_safe(update: dict) -> bool:
+    """Persist update effects and its outbound outbox before acknowledging Telegram."""
+    update_id = update.get("update_id")
+    if update_id is None:
+        log.error("Update sem update_id; não será confirmado")
+        return False
+    key = str(update_id)
+    with DB_LOCK:
+        receipt = DB.setdefault("processed_updates", {}).get(key)
+    if receipt is not None:
+        if receipt.get("delivered", False):
+            return True
+        try:
+            deliver_update_outbox(key)
+            return True
+        except Exception:
+            log.exception("Falha ao reenviar outbox do update_id=%s", update_id)
+            return False
+
+    message = update.get("message") or {}
+    sender = message.get("from") or {}
+    uid_key = str(sender["id"]) if sender.get("id") is not None else None
+    with DB_LOCK:
+        had_user = uid_key in DB["users"] if uid_key is not None else False
+        user_snapshot = deepcopy(DB["users"].get(uid_key)) if had_user else None
+        referrals_snapshot = deepcopy(DB["referrals"]) if not had_user else None
+    UPDATE_CONTEXT.defer_save = True
+    UPDATE_CONTEXT.outbox = []
     try:
         handle_update(update)
+        outbox = deepcopy(UPDATE_CONTEXT.outbox)
+        UPDATE_CONTEXT.defer_save = False
+        UPDATE_CONTEXT.outbox = None
+        with DB_LOCK:
+            DB.setdefault("processed_updates", {})[key] = {
+                "completed_at": utc_now(),
+                "delivered": False,
+                "outbox": outbox,
+            }
+            save_json(DATA_FILE, DB)
     except Exception:
-        log.exception("Falha ao processar update_id=%s", update.get("update_id"))
+        UPDATE_CONTEXT.defer_save = False
+        UPDATE_CONTEXT.outbox = None
+        with DB_LOCK:
+            # Roll back only this sender's state; never overwrite other users' concurrent work.
+            if uid_key is not None:
+                if had_user:
+                    DB["users"][uid_key] = user_snapshot
+                else:
+                    DB["users"].pop(uid_key, None)
+                    if referrals_snapshot is not None:
+                        DB["referrals"].clear()
+                        DB["referrals"].update(referrals_snapshot)
+        log.exception("Falha ao processar update_id=%s; update continuará pendente", update_id)
+        return False
+
+    try:
+        deliver_update_outbox(key)
+        return True
+    except Exception:
+        log.exception("Entrega pendente para update_id=%s; resposta ficou em outbox durável", update_id)
+        return False
+
+
+def process_updates_sequentially(updates: list[dict], offset: int | None = None) -> int | None:
+    """Advance offset only after each update has completed successfully."""
+    for update in updates:
+        if not process_update_safe(update):
+            break
+        offset = update["update_id"] + 1
+    return offset
 
 
 def run_bot() -> None:
+    record_poll_health("starting", authenticated=False)
     if not TELEGRAM_BOT_TOKEN:
+        record_poll_health("configuration_error", authenticated=False)
         raise SystemExit("Configuração ausente: defina TELEGRAM_BOT_TOKEN nas variáveis de ambiente.")
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY não configurada: comandos básicos funcionam, mas a IA ficará indisponível.")
 
     me = tg("getMe", timeout=20)
     if not me.get("ok"):
+        record_poll_health("telegram_auth_failed", authenticated=False, error_code=me.get("error_code"))
         raise SystemExit(f"Telegram não autenticou o bot: {me.get('description', 'erro desconhecido')}")
+    record_poll_health("connecting", authenticated=True)
     username = me.get("result", {}).get("username", "desconhecido")
 
     webhook = tg("deleteWebhook", timeout=20, drop_pending_updates=False)
@@ -473,22 +662,30 @@ def run_bot() -> None:
                     code = data.get("error_code")
                     log.error("getUpdates falhou (%s): %s", code, data.get("description"))
                     if code == 409:
+                        record_poll_health("polling_conflict", authenticated=True, error_code=code)
                         log.error("Conflito de polling: outro processo ou webhook está usando este bot.")
                         time.sleep(10)
                     elif code in (401, 404):
+                        record_poll_health("telegram_auth_failed", authenticated=False, error_code=code)
                         raise SystemExit("Token inválido/revogado. Gere um novo no @BotFather.")
                     else:
+                        record_poll_health("polling_degraded", authenticated=True, error_code=code)
                         time.sleep(5)
                     continue
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    pool.submit(process_update_safe, update)
+                record_poll_health(
+                    "polling",
+                    authenticated=True,
+                    error_code=None,
+                    successful_poll=True,
+                )
+                offset = process_updates_sequentially(data.get("result", []), offset)
             except KeyboardInterrupt:
                 log.info("Encerramento solicitado.")
                 STOP.set()
             except SystemExit:
                 raise
             except Exception:
+                record_poll_health("polling_degraded", authenticated=True)
                 log.exception("Erro inesperado no loop de polling")
                 time.sleep(3)
 
