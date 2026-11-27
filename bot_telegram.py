@@ -102,7 +102,7 @@ client_groq = (
     OpenAI(
         base_url="https://api.groq.com/openai/v1",
         api_key=GROQ_API_KEY,
-        timeout=45.0,
+        request_timeout=45.0,
         max_retries=2,
     )
     if GROQ_API_KEY
@@ -311,11 +311,11 @@ def run_http_server() -> None:
             raise
 
 # ---- Telegram helpers ----
-def tg(method: str, timeout=30, **payload) -> dict:
+def tg(method: str, request_timeout=30, **payload) -> dict:
     if not TELEGRAM_API:
         return {"ok": False, "error_code": 0, "description": "TELEGRAM_BOT_TOKEN não configurado"}
     try:
-        response = HTTP.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=timeout)
+        response = HTTP.post(f"{TELEGRAM_API}/{method}", json=payload, request_timeout=timeout)
         try:
             result = response.json()
         except ValueError:
@@ -352,11 +352,11 @@ def send_message(chat_id, text) -> None:
                 outbox.append({"chat_id": chat_id, "text": chunk, "delivered": False})
         return
     for chunk in split_text(text):
-        result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
+        result = tg("sendMessage", request_timeout=20, chat_id=chat_id, text=chunk)
         if not result.get("ok") and result.get("error_code") == 429:
             retry = result.get("parameters", {}).get("retry_after", 2)
             time.sleep(min(max(int(retry), 1), 10))
-            result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
+            result = tg("sendMessage", request_timeout=20, chat_id=chat_id, text=chunk)
         if not result.get("ok"):
             log.error("sendMessage falhou; update não será confirmado: %s", result.get("description"))
             raise RuntimeError("Telegram sendMessage failed")
@@ -534,11 +534,11 @@ def deliver_update_outbox(update_key: str) -> None:
                 return
             item = receipt["outbox"][pending_index]
 
-        result = tg("sendMessage", timeout=20, chat_id=item["chat_id"], text=item["text"])
+        result = tg("sendMessage", request_timeout=20, chat_id=item["chat_id"], text=item["text"])
         if not result.get("ok") and result.get("error_code") == 429:
             retry = result.get("parameters", {}).get("retry_after", 2)
             time.sleep(min(max(int(retry), 1), 10))
-            result = tg("sendMessage", timeout=20, chat_id=item["chat_id"], text=item["text"])
+            result = tg("sendMessage", request_timeout=20, chat_id=item["chat_id"], text=item["text"])
         if not result.get("ok"):
             log.error("sendMessage falhou; update não será confirmado: %s", result.get("description"))
             raise RuntimeError("Telegram sendMessage failed")
@@ -629,14 +629,14 @@ def run_bot() -> None:
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY não configurada: comandos básicos funcionam, mas a IA ficará indisponível.")
 
-    me = tg("getMe", timeout=20)
+    me = tg("getMe", request_timeout=20)
     if not me.get("ok"):
         record_poll_health("telegram_auth_failed", authenticated=False, error_code=me.get("error_code"))
         raise SystemExit(f"Telegram não autenticou o bot: {me.get('description', 'erro desconhecido')}")
     record_poll_health("connecting", authenticated=True)
     username = me.get("result", {}).get("username", "desconhecido")
 
-    webhook = tg("deleteWebhook", timeout=20, drop_pending_updates=False)
+    webhook = tg("deleteWebhook", request_timeout=20, drop_pending_updates=False)
     if not webhook.get("ok"):
         log.warning("Não foi possível remover webhook: %s", webhook.get("description"))
     commands = [
@@ -647,7 +647,7 @@ def run_bot() -> None:
         {"command": "cancelar", "description": "Cancelar preenchimento"},
         {"command": "ajuda", "description": "Ver comandos"},
     ]
-    tg("setMyCommands", timeout=20, commands=commands)
+    tg("setMyCommands", request_timeout=20, commands=commands)
     log.info("Bot iniciado: @%s", username)
 
     offset = None
@@ -657,7 +657,7 @@ def run_bot() -> None:
                 params = {"timeout": 25, "allowed_updates": ["message"]}
                 if offset is not None:
                     params["offset"] = offset
-                data = tg("getUpdates", timeout=35, **params)
+                data = tg("getUpdates", request_timeout=35, **params)
                 if not data.get("ok"):
                     code = data.get("error_code")
                     log.error("getUpdates falhou (%s): %s", code, data.get("description"))
