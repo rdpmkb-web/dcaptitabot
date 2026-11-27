@@ -158,6 +158,34 @@ class DurableIdempotencyTests(unittest.TestCase):
         self.assertEqual(self.db["users"]["counter"], 1)
         self.assertTrue(self.db["processed_updates"]["502"]["delivered"])
 
+    def test_partial_chunk_delivery_does_not_repeat_confirmed_chunk(self):
+        update = {"update_id": 503}
+        def handler(_update):
+            bot_telegram.send_message(123, "primeira parte\\n" + ("x" * 4100))
+
+        # The first chunk succeeds, the second fails, then the retry succeeds.
+        outcomes = iter([
+            {"ok": True},
+            {"ok": False, "error_code": 500, "description": "temporary failure"},
+            {"ok": True},
+        ])
+        sent_texts = []
+        def telegram(*args, **kwargs):
+            sent_texts.append(kwargs["text"])
+            return next(outcomes)
+
+        with patch.object(bot_telegram, "handle_update", side_effect=handler), patch.object(
+            bot_telegram, "tg", side_effect=telegram
+        ):
+            self.assertFalse(bot_telegram.process_update_safe(update))
+            self.assertTrue(bot_telegram.process_update_safe(update))
+
+        self.assertEqual(len(sent_texts), 3)
+        self.assertEqual(sent_texts[0], sent_texts[2])
+        self.assertNotEqual(sent_texts[0], sent_texts[1])
+        self.assertTrue(self.db["processed_updates"]["503"]["delivered"])
+        self.assertTrue(all(item["delivered"] for item in self.db["processed_updates"]["503"]["outbox"]))
+
 
 if __name__ == "__main__":
     unittest.main()
