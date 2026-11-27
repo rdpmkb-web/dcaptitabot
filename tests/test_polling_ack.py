@@ -88,5 +88,18 @@ class PollingReadinessTests(unittest.TestCase):
         self.assertNotIn("test-token", str(payload))
 
 
+class FailedDeliveryTests(unittest.TestCase):
+    def test_failed_telegram_send_raises(self):
+        failure = {"ok": False, "error_code": 500, "description": "temporary failure"}
+        with patch.object(bot_telegram, "tg", return_value=failure):
+            with self.assertRaisesRegex(RuntimeError, "sendMessage failed"):
+                bot_telegram.send_message(123, "resposta final")
+
+    def test_processing_failure_is_not_acknowledged(self):
+        update = {"update_id": 88, "message": {"text": "teste"}}
+        with patch.object(bot_telegram, "handle_update", side_effect=RuntimeError("send failed")):
+            self.assertFalse(bot_telegram.process_update_safe(update))
+
+
 if __name__ == "__main__":
     unittest.main()
