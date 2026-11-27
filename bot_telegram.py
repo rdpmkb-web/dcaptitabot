@@ -185,7 +185,7 @@ def polling_health_snapshot(now_epoch: float | None = None) -> tuple[int, dict]:
     }
 
 
-def load_json(path: Path, default):def load_json(path: Path, default):
+def load_json(path: Path, default):
     try:
         if path.exists():
             with path.open("r", encoding="utf-8") as f:
@@ -340,15 +340,13 @@ def split_text(text: str, size=4000) -> list[str]:
 def send_message(chat_id, text) -> None:
     for chunk in split_text(text):
         result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
+        if not result.get("ok") and result.get("error_code") == 429:
+            retry = result.get("parameters", {}).get("retry_after", 2)
+            time.sleep(min(max(int(retry), 1), 10))
+            result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
         if not result.get("ok"):
-            log.warning("sendMessage falhou: %s", result.get("description"))
-            # Limite de taxa/erro temporário: tentativa única curta.
-            if result.get("error_code") == 429:
-                retry = result.get("parameters", {}).get("retry_after", 2)
-                time.sleep(min(max(int(retry), 1), 10))
-                result = tg("sendMessage", timeout=20, chat_id=chat_id, text=chunk)
-                if not result.get("ok"):
-                    log.warning("Repetição sendMessage falhou: %s", result.get("description"))
+            log.error("sendMessage falhou; update não será confirmado: %s", result.get("description"))
+            raise RuntimeError("Telegram sendMessage failed")
 
 
 def ask_ai(user_prompt: str) -> str:
@@ -508,11 +506,23 @@ def handle_update(update: dict) -> None:
             send_message(chat_id, ask_ai(incoming[:APP_CONFIG["max_message_chars"]]))
 
 
-def process_update_safe(update: dict) -> None:
+def process_update_safe(update: dict) -> bool:
+    """Return True only when processing completed; False keeps the Telegram update pending."""
     try:
         handle_update(update)
+        return True
     except Exception:
-        log.exception("Falha ao processar update_id=%s", update.get("update_id"))
+        log.exception("Falha ao processar update_id=%s; update continuará pendente", update.get("update_id"))
+        return False
+
+
+def process_updates_sequentially(updates: list[dict], offset: int | None = None) -> int | None:
+    """Advance offset only after each update has completed successfully."""
+    for update in updates:
+        if not process_update_safe(update):
+            break
+        offset = update["update_id"] + 1
+    return offset
 
 
 def run_bot() -> None:
@@ -572,9 +582,7 @@ def run_bot() -> None:
                     error_code=None,
                     successful_poll=True,
                 )
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    pool.submit(process_update_safe, update)
+                offset = process_updates_sequentially(data.get("result", []), offset)
             except KeyboardInterrupt:
                 log.info("Encerramento solicitado.")
                 STOP.set()
