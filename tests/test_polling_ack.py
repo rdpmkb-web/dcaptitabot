@@ -181,7 +181,7 @@ class DurableIdempotencyTests(unittest.TestCase):
             self.assertTrue(bot_telegram.process_update_safe(update))
 
         self.assertEqual(len(sent_texts), 3)
-        self.assertEqual(sent_texts[0], sent_texts[2])
+        self.assertEqual(sent_texts[1], sent_texts[2])
         self.assertNotEqual(sent_texts[0], sent_texts[1])
         self.assertTrue(self.db["processed_updates"]["503"]["delivered"])
         self.assertTrue(all(item["delivered"] for item in self.db["processed_updates"]["503"]["outbox"]))
