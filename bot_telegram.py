@@ -102,7 +102,7 @@ client_groq = (
     OpenAI(
         base_url="https://api.groq.com/openai/v1",
         api_key=GROQ_API_KEY,
-        request_timeout=45.0,
+        timeout=45.0,
         max_retries=2,
     )
     if GROQ_API_KEY
